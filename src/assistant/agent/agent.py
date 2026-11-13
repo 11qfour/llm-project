@@ -4,9 +4,9 @@ import json
 import re
 from collections.abc import Callable
 
-from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.agent.tools import TOOL_SCHEMAS, WAREHOUSES
 from assistant.infra.erp_client import ErpUnavailable
-from assistant.infra.grounding import code_type, find_codes
+from assistant.infra.grounding import code_type, find_codes, normalize_code
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
@@ -25,11 +25,17 @@ REQUIRED_ARGS = {s["function"]["name"]: set(s["function"]["parameters"]["require
 # паттерн цен и остатков
 _NUMBER = r"(?<![\w-])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w-])"
 _WITH_UNIT = re.compile(rf"({_NUMBER})\s*(руб|₽|шт)", re.IGNORECASE)
+_CODE_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?|\bSO-\d+\b")
 
 def _known_codes(question: str, steps: list[ToolStep]) -> set[str]:
     """Все коды из вопроса и успешных результатов прошлых шагов."""
     text = question + " " + json.dumps([s.result for s in steps if s.result], ensure_ascii=False)
     return set(find_codes(text))
+
+
+def _numbers_without_codes(text: str) -> set[str]:
+    """Все числа из текста после удаления артикулов и кодов моделей/заказов."""
+    return set(re.findall(r"\d+", _CODE_RE.sub(" ", text)))
 
 
 def _check_call(call: ToolCall, tools: dict, question: str, steps: list[ToolStep]) -> str | None:
@@ -39,8 +45,11 @@ def _check_call(call: ToolCall, tools: dict, question: str, steps: list[ToolStep
     if not isinstance(call.arguments, dict) or "_raw" in call.arguments:
         return "Некорректный JSON в аргументах вызова"
     required = REQUIRED_ARGS.get(call.name, set())
-    if not required.issubset(call.arguments):
-        return f"Не хватает обязательных аргументов: {sorted(required - set(call.arguments))}"
+    if set(call.arguments) != required:
+        return f"Некорректный набор аргументов: ожидаются {sorted(required)}"
+
+    if "warehouse" in call.arguments and call.arguments["warehouse"] not in WAREHOUSES:
+        return f"Неизвестный склад: {call.arguments['warehouse']}"
 
     if "part_id" in call.arguments:
         part_id = str(call.arguments["part_id"])
@@ -52,11 +61,13 @@ def _check_call(call: ToolCall, tools: dict, question: str, steps: list[ToolStep
             )
 
     if call.name == "create_service_order":
+        model = call.arguments.get("model")
+        norm_model = normalize_code(model) if isinstance(model, str) else None
+        if not norm_model or code_type(norm_model) != "Model":
+            return f"Некорректный код модели: {model}"
         qty = call.arguments.get("qty")
-        # исключение кодов из вопроса и проверка называл ли пользователь число qty
-        q_without_codes = re.sub(r"[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?", " ", question)
-        user_nums = {int(n) for n in re.findall(r"\d+", q_without_codes)}
-        if not isinstance(qty, int) or qty not in user_nums:
+        user_nums = {int(n) for n in _numbers_without_codes(question)}
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0 or qty not in user_nums:
             return "Количество не указано пользователем в вопросе. Уточните количество у пользователя."
 
     return None
@@ -68,7 +79,7 @@ def _has_hallucinations(answer: str, question: str, steps: list[ToolStep]) -> bo
     if any(code not in known for code in find_codes(answer)):
         return True
     tool_text = json.dumps([s.result for s in steps if s.result], ensure_ascii=False)
-    allowed_nums = set(re.findall(r"\d+", tool_text)) | set(re.findall(r"\d+", question))
+    allowed_nums = _numbers_without_codes(tool_text) | _numbers_without_codes(question)
     for raw_num, _ in _WITH_UNIT.findall(answer):
         digits = re.sub(r"\D", "", raw_num)
         if digits not in allowed_nums:
@@ -109,9 +120,10 @@ def run_agent(
     ]
     steps: list[ToolStep] = []
     seen_calls: dict[tuple[str, str], dict] = {}
+    pending_action: dict | None = None
     answer = ""
 
-    while len(steps) < max_steps:
+    while len(steps) < max_steps and pending_action is None:
         response = llm.chat(messages, tools=TOOL_SCHEMAS)
         messages.append(response.as_message())
 
@@ -130,20 +142,16 @@ def run_agent(
                 continue
 
             if call.name == "create_service_order" and not confirm:
-                pending = {"tool": call.name, "args": dict(call.arguments)}
+                pending_action = {"tool": call.name, "args": dict(call.arguments)}
                 messages.append(tool_message(call, {"status": "waiting_confirmation", **call.arguments}))
-                reply = llm.chat(messages).content.strip() or "Подтвердите создание заказа."
-                return AgentResult(
-                    answer=reply,
-                    steps=steps,
-                    sources=_sources(steps),
-                    needs_confirmation=True,
-                    pending_action=pending,
-                )
+                answer = llm.chat(messages).content.strip() or "Подтвердите создание заказа."
+                break
 
             key = (call.name, json.dumps(call.arguments, ensure_ascii=False, sort_keys=True))
             if key in seen_calls:
-                messages.append(tool_message(call, seen_calls[key]))
+                cached = seen_calls[key]
+                steps.append(ToolStep(call.name, dict(call.arguments), result=cached, error=cached.get("error")))
+                messages.append(tool_message(call, cached))
                 continue
 
             result = None
@@ -167,8 +175,10 @@ def run_agent(
             step_err = result.get("error") if isinstance(result, dict) else None
             steps.append(ToolStep(call.name, dict(call.arguments), result=result, error=step_err))
             messages.append(tool_message(call, result))
-    else:
-        messages.append({"role": "user", "content": "Лимит шагов исчерпан. Подведи итог по тому, что удалось узнать."})
+
+    if not answer and pending_action is None:
+        prompt = "Лимит шагов исчерпан. Подведи итог по тому, что удалось узнать."
+        messages.append({"role": "user", "content": prompt})
         answer = llm.chat(messages).content.strip() or "Работа прервана: исчерпан лимит шагов."
 
     sources = _sources(steps)
@@ -184,5 +194,14 @@ def run_agent(
         answer = llm.chat(messages).content.strip()
         if _has_hallucinations(answer, question, steps) or "в базе знаний не найдено" in answer.lower():
             return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
+
+    if pending_action is not None:
+        return AgentResult(
+            answer=answer,
+            steps=steps,
+            sources=sources,
+            needs_confirmation=True,
+            pending_action=pending_action,
+        )
 
     return AgentResult(answer=answer, steps=steps, sources=sources, refused=False)
