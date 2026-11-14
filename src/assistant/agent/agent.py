@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 from assistant.agent.tools import TOOL_SCHEMAS, WAREHOUSES
 from assistant.infra.erp_client import ErpUnavailable
-from assistant.infra.grounding import code_type, find_codes, normalize_code
+from assistant.infra.grounding import LOOKALIKES, code_type, find_codes, normalize_code
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
@@ -25,9 +25,8 @@ REQUIRED_ARGS = {s["function"]["name"]: set(s["function"]["parameters"]["require
 # паттерн цен и остатков
 _CODE_RE = re.compile(
     r"(?<![0-9A-Za-zА-Яа-яЁё])"
-    r"(?:SO-\d+|(?:SB|R)-\d{4}-\d{2,3}|(?:AR|BZ|GS|SP|P|E|АР|ВЗ|СП|Р|Е)[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?)"
-    r"(?![0-9A-Za-zА-Яа-яЁё])",
-    re.IGNORECASE,
+    r"(?:SO-\d+|(?:SB|R)-\d{4}-\d{2,3}|(?:AR|BZ|GS|SP|P|E)[- ]?\d{2,4}[A-Z]?)"
+    r"(?![0-9A-Za-zА-Яа-яЁё])"
 )
 _NUMBER = r"(?<![\w-])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w-])"
 _WITH_UNIT = re.compile(rf"({_NUMBER})\s*(руб|₽|шт)", re.IGNORECASE)
@@ -39,13 +38,13 @@ def _known_codes(question: str, steps: list[ToolStep]) -> set[str]:
     return set(find_codes(text))
 
 def _is_code_token(token: str) -> bool:
-    upper = token.upper()
-    if upper.startswith(("SO-", "SB-", "R-")):
+    if token.startswith(("SO-", "SB-", "R-")):
         return True
     return normalize_code(token) is not None
 
 def _numbers_without_codes(text: str) -> set[str]:
     """Все числа из текста после удаления артикулов, кодов моделей, бюллетеней и заказов."""
+    text = text.upper().translate(LOOKALIKES)
     cleaned = _CODE_RE.sub(lambda m: " " if _is_code_token(m.group(0)) else m.group(0), text)
     return set(re.findall(r"\d+", cleaned))
 
