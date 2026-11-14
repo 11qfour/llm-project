@@ -2,7 +2,7 @@
 
 import pytest
 
-from assistant.agent.agent import run_agent
+from assistant.agent.agent import _numbers_without_codes, run_agent
 from assistant.agent.tools import TOOL_SCHEMAS, build_tools
 from assistant.infra.erp_client import ErpUnavailable
 from assistant.infra.llm import LLMResponse, ToolCall
@@ -238,3 +238,59 @@ def test_refusal_of_the_knowledge_base_is_passed_on():
     llm = FakeLLM([call("search_knowledge", question="Что означает ошибка E-99?"), "В базе знаний не найдено."])
     result = run_agent("Что означает ошибка E-99 на AR-210?", llm, tools.as_dict())
     assert result.refused and result.answer == "В базе знаний не найдено."
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Закажи 12 штук", {"12"}),
+        ("SO-123456", set()),
+        ("Оформи 2 шт. P-1042B для AR-210 при E-17 по SP-104", {"2"}),
+        ("Бюллетень SB-2025-03 и отчёт R-2025-017: 5 выездов", {"5"}),
+        ("Деталь р-1042в для ar 210 при Е-17 по цене 2630 руб.", {"2630"}),
+    ],
+)
+def test_numbers_without_codes_handles_edge_cases(text, expected):
+    assert _numbers_without_codes(text) == expected
+
+
+def test_repeated_cached_calls_still_respect_max_steps():
+    tools = Tools()
+    repeated = [call("get_price", part_id="P-1042B") for _ in range(5)]
+    llm = FakeLLM([*repeated, "Прервано по лимиту шагов."])
+    result = run_agent("Сколько стоит P-1042B?", llm, tools.as_dict(), max_steps=2)
+    assert tools.count("get_price") == 1 and len(result.steps) == 2
+
+
+def test_extra_unexpected_argument_is_rejected_without_crash():
+    tools = Tools()
+    llm = FakeLLM([call("get_price", part_id="P-1042B", warehouse="Казань"), "Цена неизвестна."])
+    result = run_agent("Сколько стоит P-1042B?", llm, tools.as_dict())
+    assert tools.count("get_price") == 0 and result.steps[0].error
+
+
+def test_part_digits_are_not_accepted_as_invented_price():
+    tools = Tools()
+    llm = FakeLLM([call("get_price", part_id="P-1042B"), "Цена 1042 руб.", "Цена 2630 руб."])
+    result = run_agent("Сколько стоит P-1042B?", llm, tools.as_dict())
+    assert len(llm.requests) == 3 and result.answer == "Цена 2630 руб."
+
+
+def test_invalid_order_args_are_not_put_into_pending_action():
+    tools = Tools()
+    bad_order = {**ORDER, "warehouse": "Екатеринбург"}
+    llm = FakeLLM([call("create_service_order", **bad_order), "Такого склада нет."])
+    result = run_agent("Оформи заказ: 2 штуки P-1042B для AR-210, склад Екатеринбург.", llm, tools.as_dict())
+    assert not result.needs_confirmation and result.pending_action is None and result.steps[0].error
+
+
+def test_hallucinated_confirmation_message_is_checked():
+    tools = Tools()
+    llm = FakeLLM(
+        [
+            call("create_service_order", **ORDER),
+            "Подтвердите заказ P-7777 за 9999 руб.",
+            "Подтвердите заказ 2 шт. P-1042B для AR-210.",
+        ]
+    )
+    result = run_agent("Оформи заказ: 2 штуки P-1042B для AR-210, склад Казань.", llm, tools.as_dict())
+    assert result.needs_confirmation and "P-7777" not in result.answer and "9999" not in result.answer

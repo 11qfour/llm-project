@@ -23,19 +23,31 @@ SYSTEM_PROMPT = (
 REQUIRED_ARGS = {s["function"]["name"]: set(s["function"]["parameters"]["required"]) for s in TOOL_SCHEMAS}
 
 # паттерн цен и остатков
+_CODE_RE = re.compile(
+    r"(?<![0-9A-Za-zА-Яа-яЁё])"
+    r"(?:SO-\d+|(?:SB|R)-\d{4}-\d{2,3}|(?:AR|BZ|GS|SP|P|E|АР|ВЗ|СП|Р|Е)[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?)"
+    r"(?![0-9A-Za-zА-Яа-яЁё])",
+    re.IGNORECASE,
+)
 _NUMBER = r"(?<![\w-])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w-])"
 _WITH_UNIT = re.compile(rf"({_NUMBER})\s*(руб|₽|шт)", re.IGNORECASE)
-_CODE_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?|\bSO-\d+\b")
+
 
 def _known_codes(question: str, steps: list[ToolStep]) -> set[str]:
     """Все коды из вопроса и успешных результатов прошлых шагов."""
     text = question + " " + json.dumps([s.result for s in steps if s.result], ensure_ascii=False)
     return set(find_codes(text))
 
+def _is_code_token(token: str) -> bool:
+    upper = token.upper()
+    if upper.startswith(("SO-", "SB-", "R-")):
+        return True
+    return normalize_code(token) is not None
 
 def _numbers_without_codes(text: str) -> set[str]:
-    """Все числа из текста после удаления артикулов и кодов моделей/заказов."""
-    return set(re.findall(r"\d+", _CODE_RE.sub(" ", text)))
+    """Все числа из текста после удаления артикулов, кодов моделей, бюллетеней и заказов."""
+    cleaned = _CODE_RE.sub(lambda m: " " if _is_code_token(m.group(0)) else m.group(0), text)
+    return set(re.findall(r"\d+", cleaned))
 
 
 def _check_call(call: ToolCall, tools: dict, question: str, steps: list[ToolStep]) -> str | None:
@@ -78,7 +90,12 @@ def _has_hallucinations(answer: str, question: str, steps: list[ToolStep]) -> bo
     known = _known_codes(question, steps)
     if any(code not in known for code in find_codes(answer)):
         return True
-    tool_text = json.dumps([s.result for s in steps if s.result], ensure_ascii=False)
+    tool_results = [
+        {k: v for k, v in s.result.items() if k != "sources"}
+        for s in steps
+        if s.result and not s.error
+    ]
+    tool_text = json.dumps(tool_results, ensure_ascii=False)
     allowed_nums = _numbers_without_codes(tool_text) | _numbers_without_codes(question)
     for raw_num, _ in _WITH_UNIT.findall(answer):
         digits = re.sub(r"\D", "", raw_num)
@@ -182,10 +199,11 @@ def run_agent(
         answer = llm.chat(messages).content.strip() or "Работа прервана: исчерпан лимит шагов."
 
     sources = _sources(steps)
+    has_valid_data = any(s.result and not s.error and not s.result.get("refused") for s in steps)
     kb_refused = any((s.result or {}).get("refused") for s in steps)
     erp_not_found = any("не найдена в ERP" in (s.error or "") for s in steps)
 
-    if "в базе знаний не найдено" in answer.lower() or kb_refused or erp_not_found:
+    if "в базе знаний не найдено" in answer.lower() or (not has_valid_data and (kb_refused or erp_not_found)):
         return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
 
     if _has_hallucinations(answer, question, steps):
