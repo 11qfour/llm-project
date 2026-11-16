@@ -44,16 +44,58 @@ class _ExtractionResponse(BaseModel):
     relations: list[_RelationResponse]
 
 
-EXAMPLE_TEXT = "Деталь P-9001 снята с производства и заменена на P-9001B."
+RELATION_MEANINGS = {
+    "BELONGS_TO": "модель входит в линейку",
+    "HAS_PART": "в модели установлена деталь с этим артикулом",
+    "IS_A": "деталь с этим артикулом является узлом указанного вида",
+    "INDICATES": "код ошибки указывает на отказ узла",
+    "FIXED_BY": "ошибка устраняется по этому регламенту",
+    "REPLACED_BY": "старая деталь заменена новой; направление от старой к новой",
+    "SUPPLIED_BY": "деталь поставляется этим поставщиком; направление от детали к поставщику",
+    "FAILED": "в отчёте о выезде зафиксирован отказ узла конкретной модели",
+}
+
+EXAMPLE_TEXT = (
+    "Модель AR-900 входит в линейку «Арктика».\n"
+    "В AR-900 установлены следующие узлы:\n"
+    "- компрессор – деталь P-9001, поставщик «КомпрессорМаш»"
+)
 EXAMPLE_RESULT = {
-    "entities": [{"type": "Part", "name": "P-9001"}, {"type": "Part", "name": "P-9001B"}],
+    "entities": [
+        {"type": "Model", "name": "AR-900"},
+        {"type": "ProductLine", "name": "Арктика"},
+        {"type": "Part", "name": "P-9001"},
+        {"type": "Component", "name": "компрессор"},
+        {"type": "Supplier", "name": "КомпрессорМаш"},
+    ],
     "relations": [
+        {
+            "subject_type": "Model",
+            "subject": "AR-900",
+            "type": "BELONGS_TO",
+            "object_type": "ProductLine",
+            "object": "Арктика",
+        },
+        {
+            "subject_type": "Model",
+            "subject": "AR-900",
+            "type": "HAS_PART",
+            "object_type": "Part",
+            "object": "P-9001",
+        },
         {
             "subject_type": "Part",
             "subject": "P-9001",
-            "type": "REPLACED_BY",
-            "object_type": "Part",
-            "object": "P-9001B",
+            "type": "IS_A",
+            "object_type": "Component",
+            "object": "компрессор",
+        },
+        {
+            "subject_type": "Part",
+            "subject": "P-9001",
+            "type": "SUPPLIED_BY",
+            "object_type": "Supplier",
+            "object": "КомпрессорМаш",
         }
     ],
 }
@@ -61,21 +103,31 @@ EXAMPLE_RESULT = {
 
 def _build_messages(chunk: Chunk, names: dict[str, list[str]]) -> list[dict]:
     """Описывает схему, направления связей и пример ответа для модели."""
-    directions = "\n".join(f"{source} -{kind}-> {target}" for kind, (source, target) in RELATION_SIGNATURES.items())
+    directions = "\n".join(
+        f"{source} -{kind}-> {target}: {RELATION_MEANINGS[kind]}"
+        for kind, (source, target) in RELATION_SIGNATURES.items()
+    )
     instruction = (
-        "Извлеки из фрагмента сущности и связи по заданной JSON-схеме. Верни только JSON.\n"
+        "Извлеки все явно указанные во фрагменте сущности и связи по заданной JSON-схеме. Верни только JSON.\n"
         f"Направления разрешённых связей:\n{directions}\n"
-        "REPLACED_BY направлена от старой детали к новой. FAILED означает зафиксированный отказ узла в отчёте.\n"
-        "Коды бери только из фрагмента и нормализуй: ar 210 -> AR-210, Е-17 -> E-17.\n"
+        "Обработай каждую строку списка и таблицы. В составе узлов строка с узлом, артикулом и поставщиком "
+        "задаёт три связи: Model HAS_PART Part, Part IS_A Component, Part SUPPLIED_BY Supplier.\n"
+        "В таблице ошибок извлеки INDICATES и FIXED_BY из каждой строки, если указаны узел и регламент.\n"
+        "Из записи 'деталь (название узла)' извлеки IS_A, даже если деталь снята с производства.\n"
+        "В регламенте 'применяется при ошибке' означает FIXED_BY. Код регламента может быть в заголовке. "
+        "FAILED извлекай только для реально зафиксированного отказа модели, не из инструкции по ремонту.\n"
+        "Для Model, Part, ErrorCode и Procedure записывай только код, без слов 'витрина', 'деталь' и т.п. "
+        "Копируй коды из списка ниже без изменений. Не переноси факты из примера в ответ.\n"
         f"Названия линеек, узлов и поставщиков бери из словаря: {json.dumps(names, ensure_ascii=False)}.\n"
         "Не придумывай связи, не добавляй цены, даты и номера отчётов. Перечисли сущности обоих концов связей.\n"
         "Плановое обслуживание без связей с ошибками не добавляй в граф. Если фактов по схеме нет, верни пустые списки."
     )
+    codes = json.dumps(find_codes(chunk.text), ensure_ascii=False)
     return [
         {"role": "system", "content": instruction},
         {"role": "user", "content": EXAMPLE_TEXT},
         {"role": "assistant", "content": json.dumps(EXAMPLE_RESULT, ensure_ascii=False)},
-        {"role": "user", "content": chunk.text},
+        {"role": "user", "content": f"Фрагмент:\n{chunk.text}\n\nКоды этого фрагмента после нормализации: {codes}"},
     ]
 
 
