@@ -1,7 +1,73 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
+from itertools import combinations, pairwise
+
+import networkx as nx
+
+from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import Answer, KnowledgeBase
+
+MAX_PATH_LENGTH = 3
+NEIGHBOURHOOD_DEPTH = 2
+MAX_FACT_CHARS = 8000
+MAX_ANSWER_TOKENS = 1024
+REFUSAL = "В базе знаний не найдено."
+
+
+def _replacement_edges(graph: nx.DiGraph, parts: set[str]) -> set[tuple[str, str]]:
+    """Собирает направленные цепочки замен; visited защищает от циклов в графе."""
+    edges: set[tuple[str, str]] = set()
+    visited: set[str] = set()
+    pending = list(parts)
+    while pending:
+        part = pending.pop()
+        if part in visited:
+            continue
+        visited.add(part)
+        for _, target, attrs in graph.out_edges(part, data=True):
+            if attrs["type"] == "REPLACED_BY":
+                edges.add((part, target))
+                pending.append(target)
+    return edges
+
+
+def _local_edges(graph: nx.DiGraph, anchors: list[str]) -> set[tuple[str, str]]:
+    """Ищет пути без учёта направления, но сохраняет исходные направления фактов."""
+    undirected = graph.to_undirected(as_view=True)
+    if len(anchors) == 1:
+        nodes = nx.single_source_shortest_path_length(undirected, anchors[0], cutoff=NEIGHBOURHOOD_DEPTH)
+        return set(graph.subgraph(nodes).edges)
+
+    edges: set[tuple[str, str]] = set()
+    for source, target in combinations(anchors, 2):
+        for path in nx.all_simple_paths(undirected, source, target, cutoff=MAX_PATH_LENGTH):
+            for left, right in pairwise(path):
+                for edge in ((left, right), (right, left)):
+                    if graph.has_edge(*edge):
+                        edges.add(edge)
+    parts = {node for edge in edges for node in edge if graph.nodes[node]["type"] == "Part"}
+    return edges | _replacement_edges(graph, parts)
+
+
+def _local_context(graph: nx.DiGraph, edges: set[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """Укладывает целые факты в лимит; источники берёт только из вошедших рёбер."""
+    facts: list[str] = []
+    sources: set[str] = set()
+    length = 0
+    # При ограничении контекста сначала сохраняем сведения о замене старых деталей.
+    ordered = sorted(edges, key=lambda edge: (graph.edges[edge]["type"] != "REPLACED_BY", edge))
+    for source, target in ordered:
+        attrs = graph.edges[source, target]
+        fact = f"{graph.nodes[source]['name']} -{attrs['type']}-> {graph.nodes[target]['name']}"
+        line = f"{len(facts) + 1}. {fact}"
+        added_length = len(line) + bool(facts)
+        if length + added_length > MAX_FACT_CHARS:
+            continue
+        facts.append(fact)
+        length += added_length
+        sources.update(chunk_id.split("#", 1)[0] for chunk_id in attrs["sources"])
+    return facts, sorted(sources)
 
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -14,8 +80,41 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Если в вопросе есть код, которого нет в графе, или фактов нет, возвращается
     `Answer(..., refused=True)` без вызова модели.
     """
-    # TODO: опорные сущности, отбор фактов, запрос к модели, источники
-    raise NotImplementedError("Реализуйте local_search")
+    anchors = {f"{code_type(code)}:{code}" for code in find_codes(question)}
+    if not anchors.issubset(kb.graph.nodes):
+        return Answer(text=REFUSAL, refused=True)
+    anchors.update(
+        f"{kind}:{name}" for kind, name in find_names(question, kb.vocabulary) if f"{kind}:{name}" in kb.graph
+    )
+    if not anchors:
+        return Answer(text=REFUSAL, refused=True)
+
+    edges = _local_edges(kb.graph, sorted(anchors))
+    facts, sources = _local_context(kb.graph, edges)
+    if not facts:
+        return Answer(text=REFUSAL, refused=True)
+
+    context = "\n".join(f"{number}. {fact}" for number, fact in enumerate(facts, start=1))
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты ассистент сервисной службы. Ответь кратко по-русски только по перечисленным фактам графа. "
+                "HAS_PART связывает модель с деталью, IS_A — деталь с видом узла, "
+                "INDICATES — ошибку с узлом, FIXED_BY — ошибку с регламентом. "
+                "SUPPLIED_BY связывает деталь с поставщиком, BELONGS_TO — модель с линейкой, "
+                "FAILED — модель с отказавшим узлом. "
+                "REPLACED_BY направлена от старой детали к новой: пройди всю показанную цепочку "
+                "и назови последнюю деталь. Не рекомендуй снятую с производства деталь. "
+                "Не добавляй коды, цены и остатки, которых нет в фактах. "
+                f"Если фактов для ответа недостаточно, ответь ровно: {REFUSAL}"
+            ),
+        },
+        {"role": "user", "content": f"Вопрос: {question}\n\nФакты графа:\n{context}"},
+    ]
+    text = llm.chat(messages, max_tokens=MAX_ANSWER_TOKENS).content.strip()
+    refused = not text or "в базе знаний не найдено" in text.lower()
+    return Answer(text=text or REFUSAL, sources=sources, facts=facts, refused=refused)
 
 
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
