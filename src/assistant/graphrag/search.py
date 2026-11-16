@@ -149,6 +149,13 @@ def _map_summary(question: str, summary: str, llm: LLMClient) -> _MapAnswer | No
     return partial if partial.score > 0 and partial.answer.strip() else None
 
 
+def _entities_supported(text: str, context: str, names: dict[str, list[str]]) -> bool:
+    """Проверяет, что коды и названия из переданного словаря встречаются в исходном контексте."""
+    return set(find_codes(text)).issubset(find_codes(context)) and set(find_names(text, names)).issubset(
+        find_names(context, names)
+    )
+
+
 def _community_sources(community: Community, graph: nx.DiGraph) -> set[str]:
     """Источники внутренних связей и принадлежности моделей к линейкам из сводки."""
     nodes = set(community.nodes)
@@ -172,9 +179,11 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """
     partials: list[dict] = []
     sources: set[str] = set()
+    line_names = {"ProductLine": kb.vocabulary.get("ProductLine", [])}
     for community in kb.communities:
         partial = _map_summary(question, community.summary, llm)
-        if partial is not None:
+        # Оценка модели не подтверждает факт: нельзя приписывать сводке другую линейку.
+        if partial is not None and _entities_supported(partial.answer, community.summary, line_names):
             partials.append({"community_id": community.community_id, "answer": partial.answer.strip()})
             sources.update(_community_sources(community, kb.graph))
     if not partials:
@@ -198,5 +207,8 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         },
     ]
     text = llm.chat(messages, max_tokens=MAX_ANSWER_TOKENS).content.strip()
+    context = question + "\n" + "\n".join(partial["answer"] for partial in partials)
+    if not _entities_supported(text, context, kb.vocabulary):
+        text = REFUSAL
     refused = not text or "в базе знаний не найдено" in text.lower()
     return Answer(text=text or REFUSAL, sources=sorted(sources), refused=refused)
