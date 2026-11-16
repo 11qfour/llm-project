@@ -100,6 +100,42 @@ EXAMPLE_RESULT = {
     ],
 }
 
+COMPOSITION_EXAMPLE_TEXT = (
+    EXAMPLE_TEXT + "\n- датчик температуры – деталь P-9002, поставщик «ТермоПрибор»"
+)
+COMPOSITION_EXAMPLE_RESULT = {
+    "entities": [
+        *EXAMPLE_RESULT["entities"],
+        {"type": "Part", "name": "P-9002"},
+        {"type": "Component", "name": "датчик температуры"},
+        {"type": "Supplier", "name": "ТермоПрибор"},
+    ],
+    "relations": [
+        *EXAMPLE_RESULT["relations"],
+        {
+            "subject_type": "Model",
+            "subject": "AR-900",
+            "type": "HAS_PART",
+            "object_type": "Part",
+            "object": "P-9002",
+        },
+        {
+            "subject_type": "Part",
+            "subject": "P-9002",
+            "type": "IS_A",
+            "object_type": "Component",
+            "object": "датчик температуры",
+        },
+        {
+            "subject_type": "Part",
+            "subject": "P-9002",
+            "type": "SUPPLIED_BY",
+            "object_type": "Supplier",
+            "object": "ТермоПрибор",
+        },
+    ],
+}
+
 
 def _build_messages(chunk: Chunk, names: dict[str, list[str]]) -> list[dict]:
     """Описывает схему, направления связей и пример ответа для модели."""
@@ -122,11 +158,22 @@ def _build_messages(chunk: Chunk, names: dict[str, list[str]]) -> list[dict]:
         "Не придумывай связи, не добавляй цены, даты и номера отчётов. Перечисли сущности обоих концов связей.\n"
         "Плановое обслуживание без связей с ошибками не добавляй в граф. Если фактов по схеме нет, верни пустые списки."
     )
+    example_text, example_result = EXAMPLE_TEXT, EXAMPLE_RESULT
+    if "## Состав узлов" in chunk.text:
+        # Несколько строк примера показывают, что HAS_PART повторяется для каждой детали.
+        example_text, example_result = COMPOSITION_EXAMPLE_TEXT, COMPOSITION_EXAMPLE_RESULT
+        instruction += (
+            "\nВ разделе 'Состав узлов' общий заголовок модели относится к КАЖДОЙ строке списка. "
+            "Для каждой строки выдай HAS_PART, IS_A и SUPPLIED_BY, если указаны все три факта. "
+            "Повторяй один и тот же код модели в subject каждой связи HAS_PART. "
+            "Это разные связи, поскольку object содержит разные артикулы. "
+            "Не ограничивай HAS_PART первой строкой и не сокращай повторы поставщиков."
+        )
     codes = json.dumps(find_codes(chunk.text), ensure_ascii=False)
     return [
         {"role": "system", "content": instruction},
-        {"role": "user", "content": EXAMPLE_TEXT},
-        {"role": "assistant", "content": json.dumps(EXAMPLE_RESULT, ensure_ascii=False)},
+        {"role": "user", "content": example_text},
+        {"role": "assistant", "content": json.dumps(example_result, ensure_ascii=False)},
         {"role": "user", "content": f"Фрагмент:\n{chunk.text}\n\nКоды этого фрагмента после нормализации: {codes}"},
     ]
 
