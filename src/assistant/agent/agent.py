@@ -109,6 +109,33 @@ def _has_hallucinations(answer: str, question: str, steps: list[ToolStep]) -> bo
     return False
 
 
+def _missing_replacements(answer: str, question: str, steps: list[ToolStep]) -> dict[str, list[str]]:
+    """Новый для пользователя снятый артикул нельзя назвать без известной замены."""
+    replacements: dict[str, set[str]] = {}
+    for step in steps:
+        if step.tool != "search_knowledge" or step.error or not step.result or step.result.get("refused"):
+            continue
+        for fact in step.result.get("facts", []):
+            codes = find_codes(fact)
+            if " -REPLACED_BY-> " in fact and len(codes) == 2 and all(code_type(c) == "Part" for c in codes):
+                replacements.setdefault(codes[0], set()).add(codes[1])
+
+    answer_codes = set(find_codes(answer))
+    missing = {}
+    for old in sorted(answer_codes - set(find_codes(question))):
+        visited = {old}
+        pending = list(replacements.get(old, []))
+        while pending:
+            new = pending.pop()
+            if new not in visited:
+                visited.add(new)
+                pending.extend(replacements.get(new, []))
+        successors = visited - {old}
+        if successors and not answer_codes.intersection(successors):
+            missing[old] = sorted(successors)
+    return missing
+
+
 def _sources(steps: list[ToolStep]) -> list[str]:
     found: list[str] = []
     for step in steps:
@@ -273,11 +300,25 @@ def run_agent(
     if "в базе знаний не найдено" in answer.lower():
         return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
 
-    if _has_hallucinations(answer, question, steps):
+    missing_replacements = _missing_replacements(answer, question, steps)
+    if _has_hallucinations(answer, question, steps) or missing_replacements:
         fix_prompt = "В ответе есть выдуманные коды, цены или остатки. Исправь ответ строго по данным инструментов."
+        if missing_replacements:
+            fix_prompt = (
+                "Проверь коды, цены и остатки. Исправь ответ строго по данным инструментов. "
+                "Ты добавил снятые артикулы без известных замен: "
+                + json.dumps(missing_replacements, ensure_ascii=False)
+                + ". Не рекомендуй старую деталь как актуальную. Учти всю цепочку REPLACED_BY. "
+                "Если спрашивают только поставщика, назови поставщика без лишнего артикула. "
+                "Старую деталь можно упомянуть вместе с её заменой."
+            )
         messages.append({"role": "user", "content": fix_prompt})
         answer = llm.chat(messages).content.strip()
-        if _has_hallucinations(answer, question, steps) or "в базе знаний не найдено" in answer.lower():
+        if (
+            _has_hallucinations(answer, question, steps)
+            or _missing_replacements(answer, question, steps)
+            or "в базе знаний не найдено" in answer.lower()
+        ):
             return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
 
     return AgentResult(answer=answer, steps=steps, sources=sources, refused=False)
