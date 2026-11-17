@@ -13,11 +13,16 @@ from assistant.infra.schemas import AgentResult, ToolStep
 REFUSAL = "В базе знаний не найдено."
 
 SYSTEM_PROMPT = (
-    "Ты ассистент диспетчера сервисной службы «ПолярТех»."
-    "Отвечай только по результатам инструментов."
-    "Если номер детали неизвестен или нужно проверить её замену по бюллетеню, сначала вызови search_knowledge."
-    "Для обзорных вопросов по линейкам вызывай summarize_topic."
-    "В ответе называй все найденные факты: узел, актуальный код детали, остаток в шт. и цену в руб."
+    "Ты ассистент диспетчера сервисной службы «ПолярТех». Отвечай только по результатам инструментов. "
+    "Для конкретных моделей, ошибок, деталей, поставщиков и регламентов вызывай search_knowledge. "
+    "Передавай в поиск полный вопрос пользователя: не теряй просьбу назвать поставщика или модели. "
+    "Для обзорных вопросов по линейкам и статистике отказов вызывай summarize_topic. "
+    "Если нужна актуальная деталь, пройди всю цепочку замен из facts и используй последнюю. "
+    "Цену получай через get_price, остаток через check_stock. "
+    "Для оформления заказа обязательно вызови create_service_order с моделью, деталью, складом и количеством. "
+    "Проверка цены и остатка не создаёт заказ. Не подменяй вызов инструмента текстом об оформлении. "
+    "При waiting_confirmation попроси подтверждение: заказ ещё не создан. "
+    "Отвечай на заданный вопрос. Не добавляй цену и остаток, если их не спрашивали."
 )
 
 REQUIRED_ARGS = {s["function"]["name"]: set(s["function"]["parameters"]["required"]) for s in TOOL_SCHEMAS}
@@ -30,6 +35,10 @@ _CODE_RE = re.compile(
 )
 _NUMBER = r"(?<![\w-])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w-])"
 _WITH_UNIT = re.compile(rf"({_NUMBER})\s*(руб|₽|шт)", re.IGNORECASE)
+_ORDER_REQUEST = re.compile(
+    r"\bзакажи(?:те)?\b|\b(?:оформи(?:те)?|создай(?:те)?|подготовь(?:те)?)\b[^.!?\n]*\bзаказ\b",
+    re.IGNORECASE,
+)
 
 
 def _known_codes(question: str, steps: list[ToolStep]) -> set[str]:
@@ -37,10 +46,12 @@ def _known_codes(question: str, steps: list[ToolStep]) -> set[str]:
     text = question + " " + json.dumps([s.result for s in steps if s.result], ensure_ascii=False)
     return set(find_codes(text))
 
+
 def _is_code_token(token: str) -> bool:
     if token.startswith(("SO-", "SB-", "R-")):
         return True
     return normalize_code(token) is not None
+
 
 def _numbers_without_codes(text: str) -> set[str]:
     """Все числа из текста после удаления артикулов, кодов моделей, бюллетеней и заказов."""
@@ -66,16 +77,15 @@ def _check_call(call: ToolCall, tools: dict, question: str, steps: list[ToolStep
         part_id = str(call.arguments["part_id"])
         known_parts = {c for c in _known_codes(question, steps) if code_type(c) == "Part"}
         if part_id not in known_parts:
-            return (
-                f"Деталь {part_id} не встречалась в вопросе или результатах. "
-                "Сначала вызовите search_knowledge."
-            )
+            return f"Деталь {part_id} не встречалась в вопросе или результатах. Сначала вызовите search_knowledge."
 
     if call.name == "create_service_order":
         model = call.arguments.get("model")
         norm_model = normalize_code(model) if isinstance(model, str) else None
         if not norm_model or code_type(norm_model) != "Model":
             return f"Некорректный код модели: {model}"
+        if norm_model not in _known_codes(question, steps):
+            return "Модель заказа не встречалась в вопросе или результатах инструментов. Уточните модель."
         qty = call.arguments.get("qty")
         user_nums = {int(n) for n in _numbers_without_codes(question)}
         if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0 or qty not in user_nums:
@@ -89,11 +99,7 @@ def _has_hallucinations(answer: str, question: str, steps: list[ToolStep]) -> bo
     known = _known_codes(question, steps)
     if any(code not in known for code in find_codes(answer)):
         return True
-    tool_results = [
-        {k: v for k, v in s.result.items() if k != "sources"}
-        for s in steps
-        if s.result and not s.error
-    ]
+    tool_results = [{k: v for k, v in s.result.items() if k != "sources"} for s in steps if s.result and not s.error]
     tool_text = json.dumps(tool_results, ensure_ascii=False)
     allowed_nums = _numbers_without_codes(tool_text) | _numbers_without_codes(question)
     for raw_num, _ in _WITH_UNIT.findall(answer):
@@ -110,6 +116,23 @@ def _sources(steps: list[ToolStep]) -> list[str]:
             if src not in found:
                 found.append(src)
     return found
+
+
+def _confirmation_text(arguments: dict) -> str:
+    """Статус заказа формируется кодом из проверенных аргументов, а не моделью."""
+    return (
+        f"Подтвердите создание заказа: деталь {arguments['part_id']}, "
+        f"количество: {arguments['qty']}, модель {arguments['model']}, склад {arguments['warehouse']}. "
+        "Заказ ещё не создан."
+    )
+
+
+def _requests_order(question: str) -> bool:
+    """Распознаёт явную команду заказать; отрицание перед командой её отменяет."""
+    return any(
+        not re.search(r"\bне\s*$", question[: match.start()], re.IGNORECASE)
+        for match in _ORDER_REQUEST.finditer(question)
+    )
 
 
 def run_agent(
@@ -137,13 +160,32 @@ def run_agent(
     steps: list[ToolStep] = []
     seen_calls: dict[tuple[str, str], dict] = {}
     pending_action: dict | None = None
+    created: ToolStep | None = None
     answer = ""
+    order_requested = _requests_order(question)
+    order_reminded = False
 
-    while len(steps) < max_steps and pending_action is None:
+    while len(steps) < max_steps and pending_action is None and created is None:
         response = llm.chat(messages, tools=TOOL_SCHEMAS)
         messages.append(response.as_message())
 
         if not response.tool_calls:
+            # Один дополнительный шанс выбрать инструмент, если модель завершила заказ обычным текстом.
+            order_attempted = any(step.tool == "create_service_order" for step in steps)
+            has_data = any(step.result and not step.error and not step.result.get("refused") for step in steps)
+            if order_requested and has_data and not order_attempted and not order_reminded:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Заказ ещё не создан и не передан на подтверждение. "
+                            "Для запрошенного заказа вызови create_service_order. "
+                            "Если не хватает аргументов, уточни их; не сообщай об успешном оформлении."
+                        ),
+                    }
+                )
+                order_reminded = True
+                continue
             answer = response.content.strip()
             break
 
@@ -159,8 +201,7 @@ def run_agent(
 
             if call.name == "create_service_order" and not confirm:
                 pending_action = {"tool": call.name, "args": dict(call.arguments)}
-                messages.append(tool_message(call, {"status": "waiting_confirmation", **call.arguments}))
-                answer = llm.chat(messages).content.strip() or "Подтвердите создание заказа."
+                answer = _confirmation_text(call.arguments)
                 break
 
             key = (call.name, json.dumps(call.arguments, ensure_ascii=False, sort_keys=True))
@@ -191,6 +232,10 @@ def run_agent(
             step_err = result.get("error") if isinstance(result, dict) else None
             steps.append(ToolStep(call.name, dict(call.arguments), result=result, error=step_err))
             messages.append(tool_message(call, result))
+            if call.name == "create_service_order" and not step_err and result.get("order_id"):
+                created = steps[-1]
+                answer = f"Заказ {result['order_id']} создан. Деталь {call.arguments['part_id']}."
+                break
 
     if not answer and pending_action is None:
         prompt = "Лимит шагов исчерпан. Подведи итог по тому, что удалось узнать."
@@ -201,17 +246,8 @@ def run_agent(
     has_valid_data = any(s.result and not s.error and not s.result.get("refused") for s in steps)
     kb_refused = any((s.result or {}).get("refused") for s in steps)
     erp_not_found = any("не найдена в ERP" in (s.error or "") for s in steps)
-
-    if "в базе знаний не найдено" in answer.lower() or (not has_valid_data and (kb_refused or erp_not_found)):
+    if pending_action is None and not has_valid_data and (kb_refused or erp_not_found):
         return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
-
-    if _has_hallucinations(answer, question, steps):
-        fix_prompt = "В ответе есть выдуманные коды, цены или остатки. Исправь ответ строго по данным инструментов."
-        messages.append({"role": "user", "content": fix_prompt})
-        answer = llm.chat(messages).content.strip()
-        if _has_hallucinations(answer, question, steps) or "в базе знаний не найдено" in answer.lower():
-            return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
-
     if pending_action is not None:
         return AgentResult(
             answer=answer,
@@ -220,5 +256,28 @@ def run_agent(
             needs_confirmation=True,
             pending_action=pending_action,
         )
+
+    if created is not None:
+        answer = f"Заказ {created.result['order_id']} создан. Деталь {created.args['part_id']}."
+    elif order_requested:
+        # Даже после неудачного напоминания нельзя отдавать неподтверждённое «заказ оформлен».
+        errors = [step.error for step in steps if step.error]
+        detail = errors[-1] if errors else "Не удалось подготовить параметры для подтверждения."
+        if len(steps) >= max_steps:
+            detail = "Лимит шагов исчерпан. " + detail
+        answer = "Заказ не создан. " + detail
+        if _has_hallucinations(answer, question, steps):
+            answer = "Заказ не создан. Уточните модель, деталь, склад и количество."
+        return AgentResult(answer=answer, steps=steps, sources=sources)
+
+    if "в базе знаний не найдено" in answer.lower():
+        return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
+
+    if _has_hallucinations(answer, question, steps):
+        fix_prompt = "В ответе есть выдуманные коды, цены или остатки. Исправь ответ строго по данным инструментов."
+        messages.append({"role": "user", "content": fix_prompt})
+        answer = llm.chat(messages).content.strip()
+        if _has_hallucinations(answer, question, steps) or "в базе знаний не найдено" in answer.lower():
+            return AgentResult(answer=REFUSAL, steps=steps, sources=sources, refused=True)
 
     return AgentResult(answer=answer, steps=steps, sources=sources, refused=False)
