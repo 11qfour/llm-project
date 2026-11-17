@@ -1,0 +1,1 @@
+{"id": "chatcmpl-462", "object": "chat.completion", "created": 1794869100, "model": "qwen3:4b-instruct-2507-q4_K_M", "system_fingerprint": "fp_ollama", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Деталь с номером P-9999 не найдена в системе ERP."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 758, "completion_tokens": 21, "total_tokens": 779}}

@@ -1,0 +1,1 @@
+{"id": "chatcmpl-653", "object": "chat.completion", "created": 1794917768, "model": "qwen3:4b-instruct-2507-q4_K_M", "system_fingerprint": "fp_ollama", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Последняя деталь в цепочке замены: P-3162"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 414, "completion_tokens": 22, "total_tokens": 436}}
