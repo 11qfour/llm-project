@@ -1,0 +1,1 @@
+{"id": "chatcmpl-392", "object": "chat.completion", "created": 1794867887, "model": "qwen3:4b-instruct-2507-q4_K_M", "system_fingerprint": "fp_ollama", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Последняя деталь в цепочке замены: P-3062C."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 491, "completion_tokens": 24, "total_tokens": 515}}

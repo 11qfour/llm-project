@@ -1,0 +1,1 @@
+{"id": "chatcmpl-960", "object": "chat.completion", "created": 1794868142, "model": "qwen3:4b-instruct-2507-q4_K_M", "system_fingerprint": "fp_ollama", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Деталь P-2110 заменяется на деталь P-2110B."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1862, "completion_tokens": 25, "total_tokens": 1887}}
