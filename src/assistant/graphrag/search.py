@@ -177,6 +177,9 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
+    if any(f"{code_type(code)}:{code}" not in kb.graph for code in find_codes(question)):
+        return Answer(text=REFUSAL, refused=True)
+
     partials: list[dict] = []
     sources: set[str] = set()
     line_names = {"ProductLine": kb.vocabulary.get("ProductLine", [])}
