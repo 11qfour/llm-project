@@ -1,12 +1,13 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ValidationError
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
+from assistant.infra.grounding import CODE_TYPES, canonical_name, code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import (
     EXTRACTION_SCHEMA,
@@ -96,13 +97,11 @@ EXAMPLE_RESULT = {
             "type": "SUPPLIED_BY",
             "object_type": "Supplier",
             "object": "КомпрессорМаш",
-        }
+        },
     ],
 }
 
-COMPOSITION_EXAMPLE_TEXT = (
-    EXAMPLE_TEXT + "\n- датчик температуры – деталь P-9002, поставщик «ТермоПрибор»"
-)
+COMPOSITION_EXAMPLE_TEXT = EXAMPLE_TEXT + "\n- датчик температуры – деталь P-9002, поставщик «ТермоПрибор»"
 COMPOSITION_EXAMPLE_RESULT = {
     "entities": [
         *EXAMPLE_RESULT["entities"],
@@ -199,6 +198,48 @@ def _normalize_entity(kind: str, name: str, names: dict[str, list[str]], codes: 
     return Entity(type=kind, name=canonical)
 
 
+def _composition_relations(chunk: Chunk, names: dict[str, list[str]]) -> list[Relation]:
+    """Дополняет пропуски LLM только по явным строкам раздела «Состав узлов»."""
+    sections = re.split(r"(?m)^##\s+", chunk.text)
+    models = [code for code in find_codes(chunk.text) if code_type(code) == "Model"]
+    if len(models) != 1:
+        return []  # Не угадываем, какой модели принадлежит строка.
+    model = Entity(type="Model", name=models[0])
+    relations = []
+    for section in sections[1:]:
+        heading, _, body = section.partition("\n")
+        if heading.strip().casefold() != "состав узлов":
+            continue
+        intro = re.split(r"(?m)^\s*[-*]\s+", body, maxsplit=1)[0]
+        if model.name not in find_codes(intro) or not re.search(r"\bустановлены\b", intro, re.IGNORECASE):
+            continue
+        if re.search(r"\bне\s+установлены\b", intro, re.IGNORECASE):
+            continue
+        for line in body.splitlines():
+            # Принимаем только форму «- узел — деталь CODE, поставщик ...».
+            if not re.match(r"\s*[-*]\s+.+?\s+[–—-]\s+деталь\s+", line, re.IGNORECASE):
+                continue
+            if re.search(r"\b(?:не|нет|отсутствует)\b", line, re.IGNORECASE):
+                continue
+            codes = find_codes(line)
+            if len(codes) != 1 or code_type(codes[0]) != "Part":
+                continue
+            found = find_names(line, names)
+            components = [name for kind, name in found if kind == "Component"]
+            suppliers = [name for kind, name in found if kind == "Supplier"]
+            if len(components) != 1 or len(suppliers) != 1:
+                continue
+            part = Entity(type="Part", name=codes[0])
+            relations.extend(
+                [
+                    Relation(subject=model, type="HAS_PART", object=part),
+                    Relation(subject=part, type="IS_A", object=Entity(type="Component", name=components[0])),
+                    Relation(subject=part, type="SUPPLIED_BY", object=Entity(type="Supplier", name=suppliers[0])),
+                ]
+            )
+    return relations
+
+
 def _to_result(data: _ExtractionResponse, chunk: Chunk, names: dict[str, list[str]]) -> ExtractionResult:
     """Нормализует сущности и связи; каждый отброшенный элемент увеличивает dropped."""
     result = ExtractionResult(chunk_id=chunk.chunk_id, doc_id=chunk.doc_id)
@@ -223,6 +264,11 @@ def _to_result(data: _ExtractionResponse, chunk: Chunk, names: dict[str, list[st
             continue
         entities[subject.node_id] = subject
         entities[obj.node_id] = obj
+        if relation not in result.relations:
+            result.relations.append(relation)
+    for relation in _composition_relations(chunk, names):
+        entities[relation.subject.node_id] = relation.subject
+        entities[relation.object.node_id] = relation.object
         if relation not in result.relations:
             result.relations.append(relation)
     result.entities = list(entities.values())
